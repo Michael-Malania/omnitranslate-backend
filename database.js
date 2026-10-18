@@ -6,11 +6,8 @@ dotenv.config();
 
 const DEFAULT_DEVELOPER_EMAILS = [
   'malaniamichael@gmail.com',
-  'bnbstakers@protonmail.com',
   'developer@omnitranslate.live',
-  'admin@omnitranslate.live',
-  'ninotura.kura@gmail.com',
-  'ninoturakura@gmail.com'
+  'admin@omnitranslate.live'
 ];
 
 const FREE_TIER_MAX_TRANSLATIONS = 15;
