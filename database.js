@@ -8,7 +8,9 @@ const DEFAULT_DEVELOPER_EMAILS = [
   'malaniamichael@gmail.com',
   'bnbstakers@protonmail.com',
   'developer@omnitranslate.live',
-  'admin@omnitranslate.live'
+  'admin@omnitranslate.live',
+  'ninotura.kura@gmail.com',
+  'ninoturakura@gmail.com'
 ];
 
 const FREE_TIER_MAX_TRANSLATIONS = 15;
@@ -108,14 +110,24 @@ class Database {
     }
   }
 
+  normalizeEmail(email) {
+    if (!email) return '';
+    const clean = email.toLowerCase().trim();
+    const parts = clean.split('@');
+    if (parts.length === 2 && parts[1] === 'gmail.com') {
+      return `${parts[0].replace(/\./g, '')}@gmail.com`;
+    }
+    return clean;
+  }
+
   isDeveloperEmail(email) {
     if (!email) return false;
-    const clean = email.toLowerCase().trim();
+    const clean = this.normalizeEmail(email);
     const envDevs = (process.env.DEVELOPER_EMAILS || '')
       .split(',')
-      .map(e => e.trim().toLowerCase())
+      .map(e => this.normalizeEmail(e.trim()))
       .filter(Boolean);
-    const allDevs = [...this.systemConfig.developerEmails, ...envDevs];
+    const allDevs = [...this.systemConfig.developerEmails.map(e => this.normalizeEmail(e)), ...envDevs];
     return allDevs.some(dev => clean === dev || clean.endsWith('@omnitranslate.live'));
   }
 
@@ -131,6 +143,7 @@ class Database {
       isPaid: Boolean(row.is_paid),
       isDeveloper: Boolean(row.is_developer),
       developerBypass: Boolean(row.developer_bypass),
+      hasPassword: Boolean(row.password_hash),
       usage: {
         translationsCount: Number(row.translations_count) || 0,
         secondsTotal: Number(row.seconds_total) || 0,

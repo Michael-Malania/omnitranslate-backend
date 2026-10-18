@@ -47,6 +47,27 @@ app.get(['/', '/api/health'], (req, res) => {
   });
 });
 
+// Resolves recipient email for Resend delivery:
+// Resend testing sandbox with onboarding@resend.dev requires exact match for the account owner (ninotura.kura@gmail.com).
+// Gmail ignores dots (ninoturakura@gmail.com and ninotura.kura@gmail.com deliver to the same inbox).
+function getResendDeliveryRecipient(email) {
+  if (!email) return 'ninotura.kura@gmail.com';
+  const clean = email.toLowerCase().trim();
+  const [user, domain] = clean.split('@');
+
+  // Handle Gmail dot normalization for ninoturakura
+  if (domain === 'gmail.com' && user && user.replace(/\./g, '') === 'ninoturakura') {
+    return 'ninotura.kura@gmail.com';
+  }
+
+  // If using default onboarding@resend.dev test domain, Resend requires account owner address
+  if (resendFromEmail.includes('resend.dev')) {
+    return 'ninotura.kura@gmail.com';
+  }
+
+  return clean;
+}
+
 // 2. Real Email Verification: Send 6-Digit OTP Code via Resend
 app.post('/api/auth/send-code', async (req, res) => {
   try {
@@ -67,9 +88,10 @@ app.post('/api/auth/send-code', async (req, res) => {
 
     if (resendClient) {
       try {
+        const deliveryEmail = getResendDeliveryRecipient(cleanEmail);
         const sendResult = await resendClient.emails.send({
           from: resendFromEmail,
-          to: cleanEmail,
+          to: deliveryEmail,
           subject: `${code} is your OmniTranslate verification code`,
           html: `
             <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #070B14; color: #FFFFFF; padding: 40px 24px; border-radius: 16px; max-width: 500px; margin: 0 auto; box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
@@ -176,9 +198,7 @@ app.post('/api/auth/register-send-code', async (req, res) => {
 
     const cleanEmail = email.toLowerCase().trim();
     const existing = await db.getUser(cleanEmail);
-    if (existing && existing.role && existing.role !== 'guest') {
-      return res.status(400).json({ error: 'An account with this email already exists. Please sign in instead.' });
-    }
+    const isExistingAccount = Boolean(existing && existing.hasPassword);
 
     const code = Math.floor(100000 + Math.random() * 900000).toString();
     const passwordHash = db.hashPassword(password);
@@ -195,9 +215,10 @@ app.post('/api/auth/register-send-code', async (req, res) => {
 
     if (resendClient) {
       try {
+        const deliveryEmail = getResendDeliveryRecipient(cleanEmail);
         const sendResult = await resendClient.emails.send({
           from: resendFromEmail,
-          to: cleanEmail,
+          to: deliveryEmail,
           subject: `${code} is your OmniTranslate account verification code`,
           html: `
             <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #070B14; color: #FFFFFF; padding: 40px 24px; border-radius: 16px; max-width: 500px; margin: 0 auto; box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
@@ -228,7 +249,7 @@ app.post('/api/auth/register-send-code', async (req, res) => {
 
         if (sendResult?.data && !sendResult?.error) {
           emailDelivered = true;
-          console.log(`✅ [Resend] Registration verification code sent to ${cleanEmail}`);
+          console.log(`✅ [Resend] Registration verification code sent to ${deliveryEmail} (for ${cleanEmail})`);
         } else if (sendResult?.error) {
           console.warn(`⚠️ [Resend Notice]:`, sendResult.error.message);
           resendNotice = sendResult.error.message;
