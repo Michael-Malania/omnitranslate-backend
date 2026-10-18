@@ -89,10 +89,14 @@ app.post('/api/auth/send-code', async (req, res) => {
     if (resendClient) {
       try {
         const deliveryEmail = getResendDeliveryRecipient(cleanEmail);
+        const subject = (deliveryEmail !== cleanEmail)
+          ? `${code} is the OmniTranslate verification code for ${cleanEmail}`
+          : `${code} is your OmniTranslate verification code`;
+
         const sendResult = await resendClient.emails.send({
           from: resendFromEmail,
           to: deliveryEmail,
-          subject: `${code} is your OmniTranslate verification code`,
+          subject,
           html: `
             <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #070B14; color: #FFFFFF; padding: 40px 24px; border-radius: 16px; max-width: 500px; margin: 0 auto; box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
               <div style="text-align: center; margin-bottom: 24px;">
@@ -100,7 +104,7 @@ app.post('/api/auth/send-code', async (req, res) => {
                   ⚡ OmniTranslate Live
                 </span>
                 <h1 style="font-size: 24px; font-weight: 800; color: #FFFFFF; margin: 16px 0 6px;">Sign In Verification Code</h1>
-                <p style="color: #94A3B8; font-size: 14px; margin: 0;">Use the code below to sign in to your OmniTranslate account on Desktop and Mobile.</p>
+                <p style="color: #94A3B8; font-size: 14px; margin: 0;">Use the code below to sign in for <strong style="color: #00F5D4;">${cleanEmail}</strong>.</p>
               </div>
 
               <div style="background: rgba(13, 22, 40, 0.9); border: 2px dashed #00F5D4; border-radius: 14px; padding: 24px; text-align: center; margin-bottom: 24px;">
@@ -216,10 +220,14 @@ app.post('/api/auth/register-send-code', async (req, res) => {
     if (resendClient) {
       try {
         const deliveryEmail = getResendDeliveryRecipient(cleanEmail);
+        const subject = (deliveryEmail !== cleanEmail)
+          ? `${code} is the OmniTranslate verification code for ${cleanEmail}`
+          : `${code} is your OmniTranslate account verification code`;
+
         const sendResult = await resendClient.emails.send({
           from: resendFromEmail,
           to: deliveryEmail,
-          subject: `${code} is your OmniTranslate account verification code`,
+          subject,
           html: `
             <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #070B14; color: #FFFFFF; padding: 40px 24px; border-radius: 16px; max-width: 500px; margin: 0 auto; box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
               <div style="text-align: center; margin-bottom: 24px;">
@@ -227,7 +235,7 @@ app.post('/api/auth/register-send-code', async (req, res) => {
                   ⚡ OmniTranslate Registration
                 </span>
                 <h1 style="font-size: 24px; font-weight: 800; color: #FFFFFF; margin: 16px 0 6px;">Verify Your Account</h1>
-                <p style="color: #94A3B8; font-size: 14px; margin: 0;">Welcome to OmniTranslate! Enter the 6-digit code below to activate your account.</p>
+                <p style="color: #94A3B8; font-size: 14px; margin: 0;">Welcome to OmniTranslate! Enter the 6-digit code below to activate account for <strong style="color: #00F5D4;">${cleanEmail}</strong>.</p>
               </div>
 
               <div style="background: rgba(13, 22, 40, 0.9); border: 2px dashed #00F5D4; border-radius: 14px; padding: 24px; text-align: center; margin-bottom: 24px;">
