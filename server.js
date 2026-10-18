@@ -239,11 +239,6 @@ app.post('/api/auth/register-send-code', async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
-  } catch (err) {
-    console.error('Error in /api/auth/register-send-code:', err);
-    return res.status(500).json({ error: err.message });
-  }
-});
 
 // 2d. Verify Registration Code & Create Account
 app.post('/api/auth/verify-registration', async (req, res) => {
