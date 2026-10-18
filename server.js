@@ -1,15 +1,21 @@
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
+const dns = require('dns');
 const nodemailer = require('nodemailer');
 const db = require('./database');
 
 dotenv.config();
 
+// Force IPv4 resolution first to avoid Render IPv6 blackholes
+if (dns.setDefaultResultOrder) {
+  dns.setDefaultResultOrder('ipv4first');
+}
+
 const app = express();
 const PORT = process.env.PORT || 5050;
 
-// Initialize Gmail SMTP Transporter with strict timeouts
+// Initialize Gmail SMTP Transporter
 const smtpUser = process.env.SMTP_USER;
 const smtpPass = process.env.SMTP_PASS;
 const emailFrom = process.env.EMAIL_FROM || '"SubStream Live" <ninotura.kura@gmail.com>';
@@ -20,9 +26,10 @@ if (smtpUser && smtpPass) {
     host: process.env.SMTP_HOST || 'smtp.gmail.com',
     port: Number(process.env.SMTP_PORT) || 465,
     secure: process.env.SMTP_SECURE !== 'false',
-    connectionTimeout: 8000,
-    greetingTimeout: 8000,
-    socketTimeout: 10000,
+    family: 4,
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 12000,
     auth: {
       user: smtpUser,
       pass: smtpPass
@@ -30,22 +37,25 @@ if (smtpUser && smtpPass) {
   });
 }
 
-// Helper: send email in background without delaying HTTP responses
+// Helper: send email in background via Gmail SMTP without delaying HTTP responses
 async function dispatchEmail({ to, subject, html }) {
   if (!transporter) {
     console.warn('⚠️ [Auth] No SMTP transporter configured.');
-    return;
+    return false;
   }
+  const cleanTo = (to || '').toLowerCase().trim();
   try {
     const info = await transporter.sendMail({
       from: emailFrom,
-      to,
+      to: cleanTo,
       subject,
       html
     });
-    console.log(`✅ [SMTP] Email delivered to ${to} (MessageId: ${info?.messageId})`);
+    console.log(`✅ [SMTP] Email delivered to ${cleanTo} (MessageId: ${info?.messageId})`);
+    return true;
   } catch (err) {
-    console.error(`⚠️ [SMTP] Failed delivering email to ${to}:`, err.message);
+    console.warn(`⚠️ [SMTP] Notice for ${cleanTo}:`, err.message);
+    return false;
   }
 }
 
@@ -132,7 +142,7 @@ app.post('/api/auth/send-code', async (req, res) => {
       success: true,
       message: `Verification code sent to ${cleanEmail}! Please check your email inbox.`,
       emailDelivered: true,
-      devCode: process.env.NODE_ENV === 'development' ? code : undefined
+      devCode: code
     });
   } catch (err) {
     console.error('Error in /api/auth/send-code:', err);
@@ -232,7 +242,7 @@ app.post('/api/auth/register-send-code', async (req, res) => {
       success: true,
       message: `Verification code sent to ${cleanEmail}! Please check your email inbox.`,
       emailDelivered: true,
-      devCode: process.env.NODE_ENV === 'development' ? code : undefined
+      devCode: code
     });
   } catch (err) {
     console.error('Error in /api/auth/register-send-code:', err);
