@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
-const { Resend } = require('resend');
+const nodemailer = require('nodemailer');
 const db = require('./database');
 
 dotenv.config();
@@ -9,10 +9,23 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5050;
 
-// Initialize Resend with secure API key from environment
-const resendApiKey = process.env.RESEND_API_KEY;
-const resendFromEmail = process.env.RESEND_FROM_EMAIL || 'OmniTranslate <onboarding@resend.dev>';
-const resendClient = resendApiKey ? new Resend(resendApiKey) : null;
+// Initialize Gmail SMTP Transporter
+const smtpUser = process.env.SMTP_USER;
+const smtpPass = process.env.SMTP_PASS;
+const emailFrom = process.env.EMAIL_FROM || '"OmniTranslate Live" <ninotura.kura@gmail.com>';
+
+let transporter = null;
+if (smtpUser && smtpPass) {
+  transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST || 'smtp.gmail.com',
+    port: Number(process.env.SMTP_PORT) || 465,
+    secure: process.env.SMTP_SECURE !== 'false',
+    auth: {
+      user: smtpUser,
+      pass: smtpPass
+    }
+  });
+}
 
 // Enable CORS for all clients (Web, Electron Desktop, Android Mobile, Localhost)
 app.use(cors({
@@ -43,32 +56,11 @@ app.get(['/', '/api/health'], (req, res) => {
     version: '1.0.0',
     timestamp: new Date().toISOString(),
     uptime: Math.round(process.uptime()),
-    hasResend: Boolean(resendClient)
+    hasSmtp: Boolean(transporter)
   });
 });
 
-// Resolves recipient email for Resend delivery:
-// Resend testing sandbox with onboarding@resend.dev requires exact match for the account owner (ninotura.kura@gmail.com).
-// Gmail ignores dots (ninoturakura@gmail.com and ninotura.kura@gmail.com deliver to the same inbox).
-function getResendDeliveryRecipient(email) {
-  if (!email) return 'ninotura.kura@gmail.com';
-  const clean = email.toLowerCase().trim();
-  const [user, domain] = clean.split('@');
-
-  // Handle Gmail dot normalization for ninoturakura
-  if (domain === 'gmail.com' && user && user.replace(/\./g, '') === 'ninoturakura') {
-    return 'ninotura.kura@gmail.com';
-  }
-
-  // If using default onboarding@resend.dev test domain, Resend requires account owner address
-  if (resendFromEmail.includes('resend.dev')) {
-    return 'ninotura.kura@gmail.com';
-  }
-
-  return clean;
-}
-
-// 2. Real Email Verification: Send 6-Digit OTP Code via Resend
+// 2. Real Email Verification: Send 6-Digit OTP Code via Gmail SMTP
 app.post('/api/auth/send-code', async (req, res) => {
   try {
     const { email, displayName } = req.body;
@@ -84,19 +76,14 @@ app.post('/api/auth/send-code', async (req, res) => {
     await db.saveVerificationCode(cleanEmail, code, displayName);
 
     let emailDelivered = false;
-    let resendNotice = '';
+    let smtpNotice = '';
 
-    if (resendClient) {
+    if (transporter) {
       try {
-        const deliveryEmail = getResendDeliveryRecipient(cleanEmail);
-        const subject = (deliveryEmail !== cleanEmail)
-          ? `${code} is the OmniTranslate verification code for ${cleanEmail}`
-          : `${code} is your OmniTranslate verification code`;
-
-        const sendResult = await resendClient.emails.send({
-          from: resendFromEmail,
-          to: deliveryEmail,
-          subject,
+        const info = await transporter.sendMail({
+          from: emailFrom,
+          to: cleanEmail,
+          subject: `${code} is your OmniTranslate verification code`,
           html: `
             <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #070B14; color: #FFFFFF; padding: 40px 24px; border-radius: 16px; max-width: 500px; margin: 0 auto; box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
               <div style="text-align: center; margin-bottom: 24px;">
@@ -124,28 +111,25 @@ app.post('/api/auth/send-code', async (req, res) => {
           `
         });
 
-        if (sendResult?.data && !sendResult?.error) {
+        if (info && info.messageId) {
           emailDelivered = true;
-          console.log(`✅ [Resend] Verification code sent to ${cleanEmail}`);
-        } else if (sendResult?.error) {
-          console.warn(`⚠️ [Resend Notice]:`, sendResult.error.message);
-          resendNotice = sendResult.error.message;
+          console.log(`✅ [SMTP] Verification code sent to ${cleanEmail} (ID: ${info.messageId})`);
         }
       } catch (sendErr) {
-        console.warn(`⚠️ [Resend Send Error]:`, sendErr.message);
-        resendNotice = sendErr.message;
+        console.warn(`⚠️ [SMTP Send Error]:`, sendErr.message);
+        smtpNotice = sendErr.message;
       }
     } else {
-      console.warn('⚠️ [Auth] No Resend API client configured.');
+      console.warn('⚠️ [Auth] No SMTP transporter configured.');
     }
 
     return res.json({
       success: true,
       message: emailDelivered 
         ? `Verification code sent to ${cleanEmail}! Please check your email inbox.` 
-        : `Verification code generated! ${resendNotice ? '(Resend Sandbox notice: ' + resendNotice + ')' : ''}`,
+        : `Verification code generated! ${smtpNotice ? '(Email delivery notice: ' + smtpNotice + ')' : ''}`,
       emailDelivered,
-      // Provide devCode in development mode or if Resend sandbox restricts domain recipient
+      // Provide devCode in development mode or if email delivery failed
       devCode: (!emailDelivered || process.env.NODE_ENV === 'development') ? code : undefined
     });
   } catch (err) {
@@ -189,7 +173,7 @@ app.post('/api/auth/verify-code', async (req, res) => {
   }
 });
 
-// 2c. Register Account: Send 6-Digit Email Verification Code via Resend
+// 2c. Register Account: Send 6-Digit Email Verification Code via Gmail SMTP
 app.post('/api/auth/register-send-code', async (req, res) => {
   try {
     const { email, password, displayName } = req.body;
@@ -215,19 +199,14 @@ app.post('/api/auth/register-send-code', async (req, res) => {
     });
 
     let emailDelivered = false;
-    let resendNotice = '';
+    let smtpNotice = '';
 
-    if (resendClient) {
+    if (transporter) {
       try {
-        const deliveryEmail = getResendDeliveryRecipient(cleanEmail);
-        const subject = (deliveryEmail !== cleanEmail)
-          ? `${code} is the OmniTranslate verification code for ${cleanEmail}`
-          : `${code} is your OmniTranslate account verification code`;
-
-        const sendResult = await resendClient.emails.send({
-          from: resendFromEmail,
-          to: deliveryEmail,
-          subject,
+        const info = await transporter.sendMail({
+          from: emailFrom,
+          to: cleanEmail,
+          subject: `${code} is your OmniTranslate account verification code`,
           html: `
             <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #070B14; color: #FFFFFF; padding: 40px 24px; border-radius: 16px; max-width: 500px; margin: 0 auto; box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
               <div style="text-align: center; margin-bottom: 24px;">
@@ -255,24 +234,23 @@ app.post('/api/auth/register-send-code', async (req, res) => {
           `
         });
 
-        if (sendResult?.data && !sendResult?.error) {
+        if (info && info.messageId) {
           emailDelivered = true;
-          console.log(`✅ [Resend] Registration verification code sent to ${deliveryEmail} (for ${cleanEmail})`);
-        } else if (sendResult?.error) {
-          console.warn(`⚠️ [Resend Notice]:`, sendResult.error.message);
-          resendNotice = sendResult.error.message;
+          console.log(`✅ [SMTP] Registration verification code sent to ${cleanEmail} (ID: ${info.messageId})`);
         }
       } catch (sendErr) {
-        console.warn(`⚠️ [Resend Send Error]:`, sendErr.message);
-        resendNotice = sendErr.message;
+        console.warn(`⚠️ [SMTP Send Error]:`, sendErr.message);
+        smtpNotice = sendErr.message;
       }
+    } else {
+      console.warn('⚠️ [Auth] No SMTP transporter configured.');
     }
 
     return res.json({
       success: true,
       message: emailDelivered
         ? `Verification code sent to ${cleanEmail}! Please check your email inbox.`
-        : `Verification code generated! ${resendNotice ? '(Resend Sandbox notice: ' + resendNotice + ')' : ''}`,
+        : `Verification code generated! ${smtpNotice ? '(Email delivery notice: ' + smtpNotice + ')' : ''}`,
       emailDelivered,
       devCode: (!emailDelivered || process.env.NODE_ENV === 'development') ? code : undefined
     });
