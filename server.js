@@ -15,7 +15,9 @@ if (dns.setDefaultResultOrder) {
 const app = express();
 const PORT = process.env.PORT || 5050;
 
-// Initialize Gmail SMTP Transporter
+// Initialize Email Transporters (Resend HTTPS + Gmail SMTP)
+const resendApiKey = process.env.RESEND_API_KEY;
+const resendFromEmail = process.env.RESEND_FROM_EMAIL || 'SubStream Live <onboarding@resend.dev>';
 const smtpUser = process.env.SMTP_USER;
 const smtpPass = process.env.SMTP_PASS;
 const emailFrom = process.env.EMAIL_FROM || '"SubStream Live" <ninotura.kura@gmail.com>';
@@ -37,26 +39,77 @@ if (smtpUser && smtpPass) {
   });
 }
 
-// Helper: send email in background via Gmail SMTP without delaying HTTP responses
+function getResendDeliveryRecipient(email) {
+  if (!email) return 'ninotura.kura@gmail.com';
+  const clean = email.toLowerCase().trim();
+  const [user, domain] = clean.split('@');
+
+  // Normalize Gmail dots for ninoturakura
+  if (domain === 'gmail.com' && user && user.replace(/\./g, '') === 'ninoturakura') {
+    return 'ninotura.kura@gmail.com';
+  }
+
+  // If using onboarding@resend.dev sandbox, route to account owner inbox
+  if (resendFromEmail.includes('resend.dev')) {
+    return 'ninotura.kura@gmail.com';
+  }
+
+  return clean;
+}
+
+// Helper: send email in background via Resend HTTPS (and SMTP fallback)
 async function dispatchEmail({ to, subject, html }) {
-  if (!transporter) {
-    console.warn('⚠️ [Auth] No SMTP transporter configured.');
-    return false;
-  }
   const cleanTo = (to || '').toLowerCase().trim();
-  try {
-    const info = await transporter.sendMail({
-      from: emailFrom,
-      to: cleanTo,
-      subject,
-      html
-    });
-    console.log(`✅ [SMTP] Email delivered to ${cleanTo} (MessageId: ${info?.messageId})`);
-    return true;
-  } catch (err) {
-    console.warn(`⚠️ [SMTP] Notice for ${cleanTo}:`, err.message);
-    return false;
+
+  // 1. Resend HTTPS API (Port 443 - works instantaneously on Render)
+  if (resendApiKey) {
+    try {
+      const deliveryEmail = getResendDeliveryRecipient(cleanTo);
+      const finalSubject = (deliveryEmail !== cleanTo)
+        ? `${subject} (for ${cleanTo})`
+        : subject;
+
+      const response = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${resendApiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          from: resendFromEmail,
+          to: deliveryEmail,
+          subject: finalSubject,
+          html
+        })
+      });
+      const data = await response.json();
+      if (response.ok && data?.id) {
+        console.log(`✅ [Resend] Verification code sent to ${deliveryEmail} (for ${cleanTo}, ID: ${data.id})`);
+        return true;
+      } else {
+        console.warn(`⚠️ [Resend Notice]:`, data?.message || JSON.stringify(data));
+      }
+    } catch (err) {
+      console.warn(`⚠️ [Resend Error]:`, err.message);
+    }
   }
+
+  // 2. Gmail SMTP Fallback
+  if (transporter) {
+    try {
+      const info = await transporter.sendMail({
+        from: emailFrom,
+        to: cleanTo,
+        subject,
+        html
+      });
+      console.log(`✅ [SMTP] Email delivered to ${cleanTo} (MessageId: ${info?.messageId})`);
+      return true;
+    } catch (err) {
+      console.warn(`⚠️ [SMTP] Notice for ${cleanTo}:`, err.message);
+    }
+  }
+  return false;
 }
 
 // Enable CORS for all clients (Web, Electron Desktop, Android Mobile, Localhost)
