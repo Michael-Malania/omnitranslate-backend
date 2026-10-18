@@ -19,6 +19,7 @@ class Database {
     this.pool = null;
     this.isPostgres = false;
     this.memoryUsers = {};
+    this.memoryOtp = {};
     this.systemConfig = {
       freeQuotaTranslations: FREE_TIER_MAX_TRANSLATIONS,
       freeQuotaSeconds: FREE_TIER_MAX_SECONDS,
@@ -67,6 +68,14 @@ class Database {
               seconds INT DEFAULT 3,
               chars INT DEFAULT 0,
               platform VARCHAR(50) DEFAULT 'desktop',
+              created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS email_verification_codes (
+              email VARCHAR(255) PRIMARY KEY,
+              code VARCHAR(10) NOT NULL,
+              display_name VARCHAR(255),
+              expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
               created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
             );
 
@@ -549,6 +558,97 @@ class Database {
       totalTranslations,
       totalMinutes: Math.round(totalSeconds / 60)
     };
+  }
+
+  async saveVerificationCode(email, code, displayName = '') {
+    if (this.initPromise) await this.initPromise;
+    const clean = email.toLowerCase().trim();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    if (this.isPostgres && this.pool) {
+      try {
+        await this.pool.query(`
+          INSERT INTO email_verification_codes (email, code, display_name, expires_at, created_at)
+          VALUES ($1, $2, $3, $4, NOW())
+          ON CONFLICT (email) DO UPDATE
+          SET code = $2,
+              display_name = COALESCE(NULLIF($3, ''), email_verification_codes.display_name),
+              expires_at = $4,
+              created_at = NOW();
+        `, [clean, code, displayName, expiresAt]);
+        return true;
+      } catch (err) {
+        console.error('[DB] saveVerificationCode Postgres error:', err.message);
+      }
+    }
+
+    this.memoryOtp[clean] = {
+      code,
+      displayName,
+      expiresAt: expiresAt.getTime()
+    };
+    return true;
+  }
+
+  async verifyCode({ email, code, platform = 'desktop' }) {
+    if (this.initPromise) await this.initPromise;
+    if (!email || !code) {
+      throw new Error('Email and verification code are required');
+    }
+    const clean = email.toLowerCase().trim();
+    const cleanCode = code.trim();
+
+    let matched = false;
+    let storedDisplayName = '';
+
+    if (this.isPostgres && this.pool) {
+      try {
+        const res = await this.pool.query(
+          'SELECT * FROM email_verification_codes WHERE LOWER(email) = LOWER($1)',
+          [clean]
+        );
+        if (res.rows.length > 0) {
+          const row = res.rows[0];
+          const isExpired = new Date(row.expires_at).getTime() < Date.now();
+          if (isExpired) {
+            await this.pool.query('DELETE FROM email_verification_codes WHERE LOWER(email) = LOWER($1)', [clean]);
+            throw new Error('Verification code has expired. Please request a new code.');
+          }
+          if (row.code === cleanCode) {
+            matched = true;
+            storedDisplayName = row.display_name;
+            await this.pool.query('DELETE FROM email_verification_codes WHERE LOWER(email) = LOWER($1)', [clean]);
+          }
+        }
+      } catch (err) {
+        if (err.message.includes('expired')) throw err;
+        console.error('[DB] verifyCode Postgres error:', err.message);
+      }
+    }
+
+    if (!matched && this.memoryOtp[clean]) {
+      const stored = this.memoryOtp[clean];
+      if (stored.expiresAt < Date.now()) {
+        delete this.memoryOtp[clean];
+        throw new Error('Verification code has expired. Please request a new code.');
+      }
+      if (stored.code === cleanCode) {
+        matched = true;
+        storedDisplayName = stored.displayName;
+        delete this.memoryOtp[clean];
+      }
+    }
+
+    if (!matched) {
+      throw new Error('Invalid verification code. Please check your email and try again.');
+    }
+
+    // Authenticated successfully! Find or create user
+    return await this.findOrCreateUser({
+      email: clean,
+      displayName: storedDisplayName,
+      platform
+    });
   }
 }
 
