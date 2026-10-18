@@ -80,6 +80,8 @@ class Database {
             );
 
             ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;
+            ALTER TABLE email_verification_codes ADD COLUMN IF NOT EXISTS password_hash TEXT;
+            ALTER TABLE email_verification_codes ADD COLUMN IF NOT EXISTS action_type VARCHAR(50) DEFAULT 'verify';
           `);
 
           // Seed default developer account if not exists
@@ -649,6 +651,137 @@ class Database {
       displayName: storedDisplayName,
       platform
     });
+  }
+
+  async saveRegistrationCode({ email, code, displayName = '', passwordHash = '' }) {
+    if (this.initPromise) await this.initPromise;
+    const clean = email.toLowerCase().trim();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    if (this.isPostgres && this.pool) {
+      try {
+        await this.pool.query(`
+          INSERT INTO email_verification_codes (email, code, display_name, password_hash, action_type, expires_at, created_at)
+          VALUES ($1, $2, $3, $4, 'register', $5, NOW())
+          ON CONFLICT (email) DO UPDATE
+          SET code = $2,
+              display_name = COALESCE(NULLIF($3, ''), email_verification_codes.display_name),
+              password_hash = $4,
+              action_type = 'register',
+              expires_at = $5,
+              created_at = NOW();
+        `, [clean, code, displayName, passwordHash, expiresAt]);
+        return true;
+      } catch (err) {
+        console.error('[DB] saveRegistrationCode Postgres error:', err.message);
+      }
+    }
+
+    this.memoryOtp[clean] = {
+      code,
+      displayName,
+      passwordHash,
+      actionType: 'register',
+      expiresAt: expiresAt.getTime()
+    };
+    return true;
+  }
+
+  async verifyRegistration({ email, code, platform = 'desktop' }) {
+    if (this.initPromise) await this.initPromise;
+    if (!email || !code) {
+      throw new Error('Email and verification code are required');
+    }
+    const clean = email.toLowerCase().trim();
+    const cleanCode = code.trim();
+
+    let matched = false;
+    let storedDisplayName = '';
+    let storedPasswordHash = '';
+
+    if (this.isPostgres && this.pool) {
+      try {
+        const res = await this.pool.query(
+          'SELECT * FROM email_verification_codes WHERE LOWER(email) = LOWER($1)',
+          [clean]
+        );
+        if (res.rows.length > 0) {
+          const row = res.rows[0];
+          const isExpired = new Date(row.expires_at).getTime() < Date.now();
+          if (isExpired) {
+            await this.pool.query('DELETE FROM email_verification_codes WHERE LOWER(email) = LOWER($1)', [clean]);
+            throw new Error('Verification code has expired. Please sign up again to receive a fresh code.');
+          }
+          if (row.code === cleanCode) {
+            matched = true;
+            storedDisplayName = row.display_name || clean.split('@')[0];
+            storedPasswordHash = row.password_hash || '';
+            await this.pool.query('DELETE FROM email_verification_codes WHERE LOWER(email) = LOWER($1)', [clean]);
+          }
+        }
+      } catch (err) {
+        if (err.message.includes('expired')) throw err;
+        console.error('[DB] verifyRegistration Postgres error:', err.message);
+      }
+    }
+
+    if (!matched && this.memoryOtp[clean]) {
+      const stored = this.memoryOtp[clean];
+      if (stored.expiresAt < Date.now()) {
+        delete this.memoryOtp[clean];
+        throw new Error('Verification code has expired. Please sign up again to receive a fresh code.');
+      }
+      if (stored.code === cleanCode) {
+        matched = true;
+        storedDisplayName = stored.displayName || clean.split('@')[0];
+        storedPasswordHash = stored.passwordHash || '';
+        delete this.memoryOtp[clean];
+      }
+    }
+
+    if (!matched) {
+      throw new Error('Invalid verification code. Please check your email and try again.');
+    }
+
+    const isDev = this.isDeveloperEmail(clean);
+    const role = isDev ? 'developer' : 'user';
+    const tier = isDev ? 'developer' : 'free';
+    const isPaid = isDev;
+    const devBypass = isDev;
+
+    if (this.isPostgres && this.pool) {
+      const res = await this.pool.query(`
+        INSERT INTO users (email, display_name, password_hash, platform, role, tier, is_paid, is_developer, developer_bypass)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        ON CONFLICT (email) DO UPDATE
+        SET display_name = COALESCE(NULLIF($2, ''), users.display_name),
+            password_hash = COALESCE(NULLIF($3, ''), users.password_hash),
+            is_developer = CASE WHEN $8 = TRUE THEN TRUE ELSE users.is_developer END,
+            role = CASE WHEN $8 = TRUE THEN 'developer' ELSE users.role END,
+            is_paid = CASE WHEN $8 = TRUE THEN TRUE ELSE users.is_paid END,
+            updated_at = NOW()
+        RETURNING *;
+      `, [clean, storedDisplayName, storedPasswordHash, platform, role, tier, isPaid, isDev, devBypass]);
+
+      return this.formatUser(res.rows[0]);
+    }
+
+    const user = {
+      email: clean,
+      displayName: storedDisplayName,
+      passwordHash: storedPasswordHash,
+      platform,
+      role,
+      tier,
+      isPaid,
+      isDeveloper: isDev,
+      developerBypass: devBypass,
+      usage: { translationsCount: 0, secondsTotal: 0, lastUsedAt: new Date().toISOString() },
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    this.memoryUsers[clean] = user;
+    return user;
   }
 }
 
