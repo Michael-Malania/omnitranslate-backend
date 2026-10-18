@@ -1,5 +1,6 @@
 const { Pool } = require('pg');
 const dotenv = require('dotenv');
+const crypto = require('crypto');
 
 dotenv.config();
 
@@ -68,6 +69,8 @@ class Database {
               platform VARCHAR(50) DEFAULT 'desktop',
               created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
             );
+
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;
           `);
 
           // Seed default developer account if not exists
@@ -194,6 +197,132 @@ class Database {
         updatedAt: new Date().toISOString()
       };
       this.memoryUsers[clean] = user;
+    }
+    return user;
+  }
+
+  hashPassword(password) {
+    const salt = crypto.randomBytes(16).toString('hex');
+    const hash = crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
+    return `${salt}:${hash}`;
+  }
+
+  verifyPassword(password, stored) {
+    if (!stored || typeof stored !== 'string' || !stored.includes(':')) return false;
+    const [salt, originalHash] = stored.split(':');
+    const hash = crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
+    return hash === originalHash;
+  }
+
+  async registerUser({ email, password, displayName, platform = 'desktop' }) {
+    if (this.initPromise) await this.initPromise;
+    if (!email || !password) {
+      throw new Error('Email and password are required');
+    }
+    const clean = email.toLowerCase().trim();
+    if (password.length < 6) {
+      throw new Error('Password must be at least 6 characters');
+    }
+
+    const isDev = this.isDeveloperEmail(clean);
+    const cleanName = displayName || clean.split('@')[0];
+    const passwordHash = this.hashPassword(password);
+
+    if (this.isPostgres && this.pool) {
+      const existing = await this.pool.query('SELECT * FROM users WHERE LOWER(email) = LOWER($1)', [clean]);
+      if (existing.rows.length > 0) {
+        if (existing.rows[0].password_hash) {
+          throw new Error('An account with this email already exists. Please sign in instead.');
+        } else {
+          const res = await this.pool.query(`
+            UPDATE users
+            SET password_hash = $2,
+                display_name = COALESCE(NULLIF($3, ''), display_name),
+                updated_at = NOW()
+            WHERE LOWER(email) = LOWER($1)
+            RETURNING *;
+          `, [clean, passwordHash, cleanName]);
+          return this.formatUser(res.rows[0]);
+        }
+      }
+
+      const role = isDev ? 'developer' : 'user';
+      const tier = isDev ? 'developer' : 'free';
+      const isPaid = isDev;
+      const devBypass = isDev;
+
+      const res = await this.pool.query(`
+        INSERT INTO users (email, display_name, password_hash, platform, role, tier, is_paid, is_developer, developer_bypass)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING *;
+      `, [clean, cleanName, passwordHash, platform, role, tier, isPaid, isDev, devBypass]);
+
+      return this.formatUser(res.rows[0]);
+    }
+
+    if (this.memoryUsers[clean] && this.memoryUsers[clean].passwordHash) {
+      throw new Error('An account with this email already exists. Please sign in instead.');
+    }
+    const user = {
+      email: clean,
+      displayName: cleanName,
+      passwordHash,
+      platform,
+      role: isDev ? 'developer' : 'user',
+      tier: isDev ? 'developer' : 'free',
+      isPaid: isDev,
+      isDeveloper: isDev,
+      developerBypass: isDev,
+      usage: { translationsCount: 0, secondsTotal: 0, lastUsedAt: new Date().toISOString() },
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    this.memoryUsers[clean] = user;
+    return user;
+  }
+
+  async loginUser({ email, password }) {
+    if (this.initPromise) await this.initPromise;
+    if (!email || !password) {
+      throw new Error('Email and password are required');
+    }
+    const clean = email.toLowerCase().trim();
+    const isDev = this.isDeveloperEmail(clean);
+
+    if (this.isPostgres && this.pool) {
+      const res = await this.pool.query('SELECT * FROM users WHERE LOWER(email) = LOWER($1)', [clean]);
+      let row = res.rows[0];
+
+      if (!row) {
+        if (isDev) {
+          return await this.registerUser({ email: clean, password, displayName: clean.split('@')[0] });
+        }
+        throw new Error('Account not found with this email. Please register first.');
+      }
+
+      if (!row.password_hash) {
+        const passwordHash = this.hashPassword(password);
+        await this.pool.query('UPDATE users SET password_hash = $2, updated_at = NOW() WHERE LOWER(email) = LOWER($1)', [clean, passwordHash]);
+        row.password_hash = passwordHash;
+      } else {
+        const valid = this.verifyPassword(password, row.password_hash);
+        if (!valid) {
+          throw new Error('Incorrect password. Please try again.');
+        }
+      }
+
+      return this.formatUser(row);
+    }
+
+    let user = this.memoryUsers[clean];
+    if (!user) {
+      if (isDev) {
+        return await this.registerUser({ email: clean, password });
+      }
+      throw new Error('Account not found with this email. Please register first.');
+    }
+    if (user.passwordHash && !this.verifyPassword(password, user.passwordHash)) {
+      throw new Error('Incorrect password. Please try again.');
     }
     return user;
   }

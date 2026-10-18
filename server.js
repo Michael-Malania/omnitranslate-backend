@@ -81,6 +81,84 @@ app.post('/api/auth/google', async (req, res) => {
   }
 });
 
+// 2b. Email & Password Registration
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { email, password, displayName, platform = 'desktop' } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    const user = await db.registerUser({
+      email,
+      password,
+      displayName,
+      platform
+    });
+
+    const permission = await db.checkUsagePermission(email);
+
+    return res.json({
+      success: true,
+      message: 'Account registered successfully',
+      user: {
+        email: user.email,
+        displayName: user.displayName,
+        photoUrl: user.photoUrl,
+        role: user.role,
+        tier: user.tier,
+        isDeveloper: user.isDeveloper,
+        isPaid: user.isPaid,
+        developerBypass: user.developerBypass,
+        usage: user.usage
+      },
+      permission
+    });
+  } catch (err) {
+    console.error('Error in /api/auth/register:', err.message);
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+// 2c. Email & Password Login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    const user = await db.loginUser({
+      email,
+      password
+    });
+
+    const permission = await db.checkUsagePermission(email);
+
+    return res.json({
+      success: true,
+      message: user.isDeveloper 
+        ? 'Signed in with Developer privileges' 
+        : 'Signed in successfully',
+      user: {
+        email: user.email,
+        displayName: user.displayName,
+        photoUrl: user.photoUrl,
+        role: user.role,
+        tier: user.tier,
+        isDeveloper: user.isDeveloper,
+        isPaid: user.isPaid,
+        developerBypass: user.developerBypass,
+        usage: user.usage
+      },
+      permission
+    });
+  } catch (err) {
+    console.error('Error in /api/auth/login:', err.message);
+    return res.status(401).json({ error: err.message });
+  }
+});
+
 // 3. User Profile & Permission Check
 app.get('/api/user/profile', async (req, res) => {
   try {
