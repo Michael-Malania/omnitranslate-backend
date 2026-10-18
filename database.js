@@ -507,19 +507,34 @@ class Database {
 
   async setTier(email, tier) {
     const clean = (email || '').toLowerCase().trim();
+    if (!clean) return null;
     const isPaid = tier === 'pro' || tier === 'enterprise' || tier === 'developer';
 
     if (this.isPostgres && this.pool) {
-      const res = await this.pool.query(`
+      let res = await this.pool.query(`
         UPDATE users
         SET tier = $2, is_paid = $3, updated_at = NOW()
         WHERE LOWER(email) = LOWER($1)
         RETURNING *;
       `, [clean, tier, isPaid]);
-      return this.formatUser(res.rows[0]);
+
+      if (!res.rows[0]) {
+        await this.findOrCreateUser({ email: clean });
+        res = await this.pool.query(`
+          UPDATE users
+          SET tier = $2, is_paid = $3, updated_at = NOW()
+          WHERE LOWER(email) = LOWER($1)
+          RETURNING *;
+        `, [clean, tier, isPaid]);
+      }
+
+      return res.rows[0] ? this.formatUser(res.rows[0]) : null;
     }
 
     let user = this.memoryUsers[clean];
+    if (!user) {
+      user = await this.findOrCreateUser({ email: clean });
+    }
     if (user) {
       user.tier = tier;
       user.isPaid = isPaid;

@@ -453,6 +453,49 @@ app.post('/api/user/toggle-developer-bypass', async (req, res) => {
   }
 });
 
+// Paddle Billing Integration Helpers
+const PADDLE_API_KEY = process.env.PADDLE_API_KEY;
+const PADDLE_ENVIRONMENT = process.env.PADDLE_ENVIRONMENT || 'sandbox';
+const PADDLE_API_BASE = PADDLE_ENVIRONMENT === 'sandbox' 
+  ? 'https://sandbox-api.paddle.com' 
+  : 'https://api.paddle.com';
+
+async function fetchPaddleTransaction(txnId) {
+  try {
+    const res = await fetch(`${PADDLE_API_BASE}/transactions/${txnId}`, {
+      headers: {
+        'Authorization': `Bearer ${PADDLE_API_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    if (!res.ok) {
+      console.warn(`[Paddle API] Failed to fetch txn ${txnId}: HTTP ${res.status}`);
+      return null;
+    }
+    const data = await res.json();
+    return data?.data || null;
+  } catch (e) {
+    console.error(`[Paddle API] Error fetching txn ${txnId}:`, e.message);
+    return null;
+  }
+}
+
+async function fetchPaddleCustomer(customerId) {
+  try {
+    const res = await fetch(`${PADDLE_API_BASE}/customers/${customerId}`, {
+      headers: {
+        'Authorization': `Bearer ${PADDLE_API_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data?.data || null;
+  } catch (e) {
+    return null;
+  }
+}
+
 // 6. Upgrade Tier (Paywall checkout completion)
 app.post('/api/user/upgrade', async (req, res) => {
   try {
@@ -473,6 +516,92 @@ app.post('/api/user/upgrade', async (req, res) => {
   } catch (err) {
     console.error('Error in /api/user/upgrade:', err);
     return res.status(500).json({ error: err.message });
+  }
+});
+
+// 6b. Verify Paddle Transaction & Instant Upgrade
+app.get('/api/paddle/verify-transaction', async (req, res) => {
+  try {
+    const { txnId, email } = req.query;
+    if (!txnId && !email) {
+      return res.status(400).json({ error: 'txnId or email is required' });
+    }
+
+    let customerEmail = email ? email.toLowerCase().trim() : null;
+    let txn = null;
+
+    if (txnId) {
+      txn = await fetchPaddleTransaction(txnId);
+      if (txn && txn.customer_id) {
+        const customer = await fetchPaddleCustomer(txn.customer_id);
+        if (customer && customer.email) {
+          customerEmail = customer.email.toLowerCase().trim();
+        }
+      }
+    }
+
+    if (customerEmail && (!txn || txn.status === 'completed' || txn.status === 'paid')) {
+      const user = await db.setTier(customerEmail, 'pro');
+      const permission = await db.checkUsagePermission(customerEmail);
+      return res.json({
+        success: true,
+        verified: true,
+        email: customerEmail,
+        status: txn?.status || 'completed',
+        user,
+        permission
+      });
+    }
+
+    return res.json({
+      success: false,
+      message: 'Transaction not yet completed or customer email not found',
+      status: txn?.status || 'pending'
+    });
+  } catch (err) {
+    console.error('[Paddle Verify Error]:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// 6c. Paddle Billing Webhook (transaction.completed, subscription.created, etc.)
+app.post('/api/paddle/webhook', async (req, res) => {
+  try {
+    const event = req.body;
+    const eventType = event?.event_type || event?.alert_name;
+    const data = event?.data;
+    console.log(`[Paddle Webhook] Received event: ${eventType}`);
+
+    let customerEmail = data?.customer?.email;
+    if (!customerEmail && data?.customer_id) {
+      const customer = await fetchPaddleCustomer(data.customer_id);
+      if (customer) customerEmail = customer.email;
+    }
+    if (!customerEmail && data?.custom_data?.email) {
+      customerEmail = data.custom_data.email;
+    }
+
+    if (customerEmail) {
+      customerEmail = customerEmail.toLowerCase().trim();
+    }
+
+    if (eventType === 'transaction.completed' || eventType === 'transaction.paid' || 
+        eventType === 'subscription.activated' || eventType === 'subscription.created') {
+      if (customerEmail) {
+        console.log(`✅ [Paddle Webhook] Upgrading user ${customerEmail} to PRO tier`);
+        await db.setTier(customerEmail, 'pro');
+      }
+    } else if (eventType === 'subscription.canceled' || eventType === 'subscription.past_due') {
+      if (customerEmail) {
+        console.log(`ℹ️ [Paddle Webhook] Downgrading user ${customerEmail} to FREE tier`);
+        await db.setTier(customerEmail, 'free');
+      }
+    }
+
+    return res.status(200).json({ received: true });
+  } catch (err) {
+    console.error('[Paddle Webhook Error]:', err.message);
+    return res.status(200).json({ received: true, error: err.message });
   }
 });
 
