@@ -81,6 +81,21 @@ class Database {
             ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;
             ALTER TABLE email_verification_codes ADD COLUMN IF NOT EXISTS password_hash TEXT;
             ALTER TABLE email_verification_codes ADD COLUMN IF NOT EXISTS action_type VARCHAR(50) DEFAULT 'verify';
+
+            CREATE TABLE IF NOT EXISTS wallet_subscribers (
+              wallet_address VARCHAR(64) PRIMARY KEY,
+              tier VARCHAR(32) DEFAULT 'free',
+              is_paid BOOLEAN DEFAULT FALSE,
+              subscription_id VARCHAR(128),
+              customer_id VARCHAR(128),
+              customer_email VARCHAR(255),
+              api_key VARCHAR(128) UNIQUE,
+              rate_limit_rps INT DEFAULT 10,
+              created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+              updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_subscribers_api_key ON wallet_subscribers (api_key);
           `);
 
           // Seed default developer account if not exists
@@ -308,41 +323,37 @@ class Database {
       throw new Error('Email and password are required');
     }
     const clean = email.toLowerCase().trim();
-    const isDev = this.isDeveloperEmail(clean);
+    const noPasswordMsg = 'This account has no password yet. Sign in with a 6-digit email code, or use "Create Account" to set a password.';
 
     if (this.isPostgres && this.pool) {
       const res = await this.pool.query('SELECT * FROM users WHERE LOWER(email) = LOWER($1)', [clean]);
-      let row = res.rows[0];
+      const row = res.rows[0];
 
       if (!row) {
-        if (isDev) {
-          return await this.registerUser({ email: clean, password, displayName: clean.split('@')[0] });
-        }
         throw new Error('Account not found with this email. Please register first.');
       }
 
+      // Never set a password from a login attempt: that would let anyone claim
+      // accounts created via email-code sign-in or usage tracking.
       if (!row.password_hash) {
-        const passwordHash = this.hashPassword(password);
-        await this.pool.query('UPDATE users SET password_hash = $2, updated_at = NOW() WHERE LOWER(email) = LOWER($1)', [clean, passwordHash]);
-        row.password_hash = passwordHash;
-      } else {
-        const valid = this.verifyPassword(password, row.password_hash);
-        if (!valid) {
-          throw new Error('Incorrect password. Please try again.');
-        }
+        throw new Error(noPasswordMsg);
+      }
+
+      if (!this.verifyPassword(password, row.password_hash)) {
+        throw new Error('Incorrect password. Please try again.');
       }
 
       return this.formatUser(row);
     }
 
-    let user = this.memoryUsers[clean];
+    const user = this.memoryUsers[clean];
     if (!user) {
-      if (isDev) {
-        return await this.registerUser({ email: clean, password });
-      }
       throw new Error('Account not found with this email. Please register first.');
     }
-    if (user.passwordHash && !this.verifyPassword(password, user.passwordHash)) {
+    if (!user.passwordHash) {
+      throw new Error(noPasswordMsg);
+    }
+    if (!this.verifyPassword(password, user.passwordHash)) {
       throw new Error('Incorrect password. Please try again.');
     }
     return user;
@@ -807,6 +818,129 @@ class Database {
     };
     this.memoryUsers[clean] = user;
     return user;
+  }
+
+  async getWalletSubscriber(walletAddress) {
+    const clean = (walletAddress || '').trim();
+    if (!clean) return null;
+    await this.initPromise;
+
+    if (this.isPostgres) {
+      try {
+        const res = await this.pool.query(
+          `SELECT * FROM wallet_subscribers WHERE wallet_address = $1 LIMIT 1`,
+          [clean]
+        );
+        if (res.rows.length > 0) {
+          const row = res.rows[0];
+          return {
+            walletAddress: row.wallet_address,
+            tier: row.tier || 'free',
+            isPaid: Boolean(row.is_paid),
+            subscriptionId: row.subscription_id,
+            customerId: row.customer_id,
+            customerEmail: row.customer_email,
+            apiKey: row.api_key,
+            rateLimitRps: Number(row.rate_limit_rps) || 10,
+            createdAt: row.created_at,
+            updatedAt: row.updated_at
+          };
+        }
+      } catch (e) {
+        console.warn(`[DB] Failed to get wallet subscriber ${clean}:`, e.message);
+      }
+    }
+
+    if (!this.memoryWalletSubscribers) this.memoryWalletSubscribers = {};
+    if (this.memoryWalletSubscribers[clean]) return this.memoryWalletSubscribers[clean];
+
+    return {
+      walletAddress: clean,
+      tier: 'free',
+      isPaid: false,
+      rateLimitRps: 10,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+  }
+
+  async setWalletSubscriberTier(walletAddress, tier = 'developer', details = {}) {
+    const clean = (walletAddress || '').trim();
+    if (!clean) return null;
+    await this.initPromise;
+
+    const isPaid = tier !== 'free';
+    const rateLimit = tier === 'institutional' ? 1000 : tier === 'developer' ? 100 : 10;
+    let apiKey = details.apiKey;
+    if (!apiKey && isPaid) {
+      const existing = await this.getWalletSubscriber(clean);
+      apiKey = existing?.apiKey || `rg_live_${crypto.randomBytes(16).toString('hex')}`;
+    }
+
+    if (this.isPostgres) {
+      try {
+        const res = await this.pool.query(`
+          INSERT INTO wallet_subscribers (
+            wallet_address, tier, is_paid, subscription_id, customer_id, customer_email, api_key, rate_limit_rps, updated_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+          ON CONFLICT (wallet_address) DO UPDATE SET
+            tier = EXCLUDED.tier,
+            is_paid = EXCLUDED.is_paid,
+            subscription_id = COALESCE(EXCLUDED.subscription_id, wallet_subscribers.subscription_id),
+            customer_id = COALESCE(EXCLUDED.customer_id, wallet_subscribers.customer_id),
+            customer_email = COALESCE(EXCLUDED.customer_email, wallet_subscribers.customer_email),
+            api_key = COALESCE(EXCLUDED.api_key, wallet_subscribers.api_key),
+            rate_limit_rps = EXCLUDED.rate_limit_rps,
+            updated_at = NOW()
+          RETURNING *;
+        `, [
+          clean,
+          tier,
+          isPaid,
+          details.subscriptionId || null,
+          details.customerId || null,
+          details.customerEmail || null,
+          apiKey || null,
+          rateLimit
+        ]);
+        if (res.rows.length > 0) {
+          const row = res.rows[0];
+          const record = {
+            walletAddress: row.wallet_address,
+            tier: row.tier,
+            isPaid: Boolean(row.is_paid),
+            subscriptionId: row.subscription_id,
+            customerId: row.customer_id,
+            customerEmail: row.customer_email,
+            apiKey: row.api_key,
+            rateLimitRps: Number(row.rate_limit_rps),
+            createdAt: row.created_at,
+            updatedAt: row.updated_at
+          };
+          if (!this.memoryWalletSubscribers) this.memoryWalletSubscribers = {};
+          this.memoryWalletSubscribers[clean] = record;
+          return record;
+        }
+      } catch (e) {
+        console.error(`[DB] Error setting wallet tier ${clean}:`, e.message);
+      }
+    }
+
+    if (!this.memoryWalletSubscribers) this.memoryWalletSubscribers = {};
+    const record = {
+      walletAddress: clean,
+      tier,
+      isPaid,
+      subscriptionId: details.subscriptionId || null,
+      customerId: details.customerId || null,
+      customerEmail: details.customerEmail || null,
+      apiKey,
+      rateLimitRps: rateLimit,
+      updatedAt: new Date().toISOString(),
+      createdAt: this.memoryWalletSubscribers[clean]?.createdAt || new Date().toISOString()
+    };
+    this.memoryWalletSubscribers[clean] = record;
+    return record;
   }
 }
 

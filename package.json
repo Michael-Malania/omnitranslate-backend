@@ -1,7 +1,7 @@
 {
   "name": "omnitranslate-backend",
   "version": "1.0.0",
-  "description": "Shared Backend & Usage Metrics API for OmniTranslate Live (Mobile, Desktop, Web)",
+  "description": "Shared Backend & Usage Metrics API for SubStream Live (Mobile, Desktop, Web)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
