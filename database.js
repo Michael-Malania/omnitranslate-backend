@@ -1,10 +1,8 @@
-const fs = require('fs');
-const path = require('path');
+const { Pool } = require('pg');
+const dotenv = require('dotenv');
 
-const DATA_DIR = path.join(__dirname, 'data');
-const DB_FILE = path.join(DATA_DIR, 'omni_store.json');
+dotenv.config();
 
-// Pre-configured developer emails that automatically receive developer privileges
 const DEFAULT_DEVELOPER_EMAILS = [
   'malaniamichael@gmail.com',
   'bnbstakers@protonmail.com',
@@ -13,44 +11,86 @@ const DEFAULT_DEVELOPER_EMAILS = [
 ];
 
 const FREE_TIER_MAX_TRANSLATIONS = 15;
-const FREE_TIER_MAX_SECONDS = 300; // 5 minutes
+const FREE_TIER_MAX_SECONDS = 300;
 
 class Database {
   constructor() {
-    this.memory = {
-      users: {},
-      transactions: [],
-      systemConfig: {
-        freeQuotaTranslations: FREE_TIER_MAX_TRANSLATIONS,
-        freeQuotaSeconds: FREE_TIER_MAX_SECONDS,
-        developerEmails: DEFAULT_DEVELOPER_EMAILS
-      }
+    this.pool = null;
+    this.isPostgres = false;
+    this.memoryUsers = {};
+    this.systemConfig = {
+      freeQuotaTranslations: FREE_TIER_MAX_TRANSLATIONS,
+      freeQuotaSeconds: FREE_TIER_MAX_SECONDS,
+      developerEmails: DEFAULT_DEVELOPER_EMAILS
     };
-    this.init();
+    this.initPromise = this.init();
   }
 
-  init() {
-    try {
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
-      }
-      if (fs.existsSync(DB_FILE)) {
-        const raw = fs.readFileSync(DB_FILE, 'utf8');
-        const parsed = JSON.parse(raw);
-        this.memory = { ...this.memory, ...parsed };
-      } else {
-        this.persist();
-      }
-    } catch (e) {
-      console.warn('[DB] Using memory storage, file init warning:', e.message);
-    }
-  }
+  async init() {
+    const connectionString = process.env.DATABASE_URL;
+    if (connectionString) {
+      try {
+        const isSsl = !connectionString.includes('localhost') && !connectionString.includes('127.0.0.1');
+        this.pool = new Pool({
+          connectionString,
+          ssl: isSsl ? { rejectUnauthorized: false } : false,
+          max: 10,
+          idleTimeoutMillis: 30000,
+          connectionTimeoutMillis: 5000
+        });
 
-  persist() {
-    try {
-      fs.writeFileSync(DB_FILE, JSON.stringify(this.memory, null, 2), 'utf8');
-    } catch (e) {
-      console.error('[DB] Failed to persist data to disk:', e.message);
+        // Test connection and initialize schema
+        const client = await this.pool.connect();
+        try {
+          await client.query(`
+            CREATE TABLE IF NOT EXISTS users (
+              email VARCHAR(255) PRIMARY KEY,
+              display_name VARCHAR(255),
+              photo_url TEXT,
+              platform VARCHAR(50) DEFAULT 'desktop',
+              role VARCHAR(50) DEFAULT 'user',
+              tier VARCHAR(50) DEFAULT 'free',
+              is_paid BOOLEAN DEFAULT FALSE,
+              is_developer BOOLEAN DEFAULT FALSE,
+              developer_bypass BOOLEAN DEFAULT FALSE,
+              translations_count INT DEFAULT 0,
+              seconds_total INT DEFAULT 0,
+              last_used_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+              created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+              updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS usage_logs (
+              id SERIAL PRIMARY KEY,
+              user_email VARCHAR(255) REFERENCES users(email) ON DELETE CASCADE,
+              seconds INT DEFAULT 3,
+              chars INT DEFAULT 0,
+              platform VARCHAR(50) DEFAULT 'desktop',
+              created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            );
+          `);
+
+          // Seed default developer account if not exists
+          for (const devEmail of DEFAULT_DEVELOPER_EMAILS) {
+            await client.query(`
+              INSERT INTO users (email, display_name, role, tier, is_paid, is_developer, developer_bypass)
+              VALUES ($1, $2, 'developer', 'developer', TRUE, TRUE, TRUE)
+              ON CONFLICT (email) DO UPDATE
+              SET is_developer = TRUE, role = 'developer', is_paid = TRUE, developer_bypass = TRUE;
+            `, [devEmail, devEmail.split('@')[0]]);
+          }
+
+          this.isPostgres = true;
+          console.log('✅ [DB] Connected to Render PostgreSQL and initialized schema successfully.');
+        } finally {
+          client.release();
+        }
+      } catch (err) {
+        console.error('⚠️ [DB] PostgreSQL connection failed, falling back to in-memory store:', err.message);
+        this.isPostgres = false;
+      }
+    } else {
+      console.log('ℹ️ [DB] No DATABASE_URL set; using in-memory store.');
     }
   }
 
@@ -61,67 +101,107 @@ class Database {
       .split(',')
       .map(e => e.trim().toLowerCase())
       .filter(Boolean);
-    const allDevs = [...this.memory.systemConfig.developerEmails, ...envDevs];
+    const allDevs = [...this.systemConfig.developerEmails, ...envDevs];
     return allDevs.some(dev => clean === dev || clean.endsWith('@omnitranslate.live'));
   }
 
-  getUser(email) {
-    if (!email) return null;
-    const clean = email.toLowerCase().trim();
-    return this.memory.users[clean] || null;
+  formatUser(row) {
+    if (!row) return null;
+    return {
+      email: row.email,
+      displayName: row.display_name,
+      photoUrl: row.photo_url || '',
+      platform: row.platform || 'desktop',
+      role: row.role || 'user',
+      tier: row.tier || 'free',
+      isPaid: Boolean(row.is_paid),
+      isDeveloper: Boolean(row.is_developer),
+      developerBypass: Boolean(row.developer_bypass),
+      usage: {
+        translationsCount: Number(row.translations_count) || 0,
+        secondsTotal: Number(row.seconds_total) || 0,
+        lastUsedAt: row.last_used_at
+      },
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    };
   }
 
-  findOrCreateUser({ email, displayName, photoUrl, platform = 'desktop' }) {
+  async getUser(email) {
+    if (this.initPromise) await this.initPromise;
     if (!email) return null;
     const clean = email.toLowerCase().trim();
-    let user = this.memory.users[clean];
-    const isDev = this.isDeveloperEmail(clean);
 
+    if (this.isPostgres && this.pool) {
+      try {
+        const res = await this.pool.query('SELECT * FROM users WHERE LOWER(email) = LOWER($1)', [clean]);
+        return this.formatUser(res.rows[0]);
+      } catch (e) {
+        console.error('[DB] getUser error:', e.message);
+      }
+    }
+    return this.memoryUsers[clean] || null;
+  }
+
+  async findOrCreateUser({ email, displayName, photoUrl, platform = 'desktop' }) {
+    if (this.initPromise) await this.initPromise;
+    if (!email) return null;
+    const clean = email.toLowerCase().trim();
+    const isDev = this.isDeveloperEmail(clean);
+    const cleanName = displayName || clean.split('@')[0];
+
+    if (this.isPostgres && this.pool) {
+      try {
+        const role = isDev ? 'developer' : 'user';
+        const tier = isDev ? 'developer' : 'free';
+        const isPaid = isDev;
+        const devBypass = isDev;
+
+        const res = await this.pool.query(`
+          INSERT INTO users (email, display_name, photo_url, platform, role, tier, is_paid, is_developer, developer_bypass)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          ON CONFLICT (email) DO UPDATE
+          SET display_name = COALESCE(NULLIF($2, ''), users.display_name),
+              photo_url = COALESCE(NULLIF($3, ''), users.photo_url),
+              is_developer = CASE WHEN $8 = TRUE THEN TRUE ELSE users.is_developer END,
+              role = CASE WHEN $8 = TRUE THEN 'developer' ELSE users.role END,
+              is_paid = CASE WHEN $8 = TRUE THEN TRUE ELSE users.is_paid END,
+              updated_at = NOW()
+          RETURNING *;
+        `, [clean, cleanName, photoUrl || '', platform, role, tier, isPaid, isDev, devBypass]);
+
+        return this.formatUser(res.rows[0]);
+      } catch (e) {
+        console.error('[DB] findOrCreateUser Postgres error:', e.message);
+      }
+    }
+
+    // Memory fallback
+    let user = this.memoryUsers[clean];
     if (!user) {
       user = {
         email: clean,
-        displayName: displayName || clean.split('@')[0],
+        displayName: cleanName,
         photoUrl: photoUrl || '',
-        platform: platform,
+        platform,
         role: isDev ? 'developer' : 'user',
         tier: isDev ? 'developer' : 'free',
         isPaid: isDev,
         isDeveloper: isDev,
-        developerBypass: isDev, // Active bypass for developer
-        usage: {
-          translationsCount: 0,
-          secondsTotal: 0,
-          lastUsedAt: new Date().toISOString()
-        },
+        developerBypass: isDev,
+        usage: { translationsCount: 0, secondsTotal: 0, lastUsedAt: new Date().toISOString() },
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       };
-      this.memory.users[clean] = user;
-      this.persist();
-    } else {
-      // Sync developer privilege in case developer list updated
-      if (isDev && !user.isDeveloper) {
-        user.isDeveloper = true;
-        user.role = 'developer';
-        user.tier = 'developer';
-        user.isPaid = true;
-        user.developerBypass = true;
-      }
-      if (displayName && displayName !== user.displayName) user.displayName = displayName;
-      if (photoUrl && photoUrl !== user.photoUrl) user.photoUrl = photoUrl;
-      user.updatedAt = new Date().toISOString();
-      this.persist();
+      this.memoryUsers[clean] = user;
     }
-
     return user;
   }
 
-  checkUsagePermission(email) {
+  async checkUsagePermission(email) {
     const clean = (email || '').toLowerCase().trim();
-    const user = this.getUser(clean);
-
-    // If no user or anonymous, allow up to free limit via anonymous device record
-    const maxAllowed = this.memory.systemConfig.freeQuotaTranslations;
+    const user = await this.getUser(clean);
+    const maxAllowed = this.systemConfig.freeQuotaTranslations;
 
     if (!user) {
       return {
@@ -189,15 +269,15 @@ class Database {
     };
   }
 
-  recordUsage({ email, seconds = 3, chars = 0, platform = 'desktop' }) {
+  async recordUsage({ email, seconds = 3, chars = 0, platform = 'desktop' }) {
     const clean = (email || '').toLowerCase().trim();
-    let user = this.getUser(clean);
+    let user = await this.getUser(clean);
 
     if (!user) {
-      user = this.findOrCreateUser({ email: clean, platform });
+      user = await this.findOrCreateUser({ email: clean, platform });
     }
 
-    const permission = this.checkUsagePermission(clean);
+    const permission = await this.checkUsagePermission(clean);
     if (!permission.allowed) {
       return {
         success: false,
@@ -209,59 +289,132 @@ class Database {
       };
     }
 
-    // Increment usage
+    const secNum = Number(seconds) || 3;
+    const charNum = Number(chars) || 0;
+
+    if (this.isPostgres && this.pool) {
+      try {
+        await this.pool.query(`
+          UPDATE users
+          SET translations_count = translations_count + 1,
+              seconds_total = seconds_total + $2,
+              last_used_at = NOW(),
+              updated_at = NOW()
+          WHERE LOWER(email) = LOWER($1);
+        `, [clean, secNum]);
+
+        await this.pool.query(`
+          INSERT INTO usage_logs (user_email, seconds, chars, platform)
+          VALUES ($1, $2, $3, $4);
+        `, [clean, secNum, charNum, platform]);
+
+        const updatedPermission = await this.checkUsagePermission(clean);
+        return {
+          success: true,
+          allowed: true,
+          reason: updatedPermission.reason,
+          stats: updatedPermission
+        };
+      } catch (e) {
+        console.error('[DB] recordUsage Postgres error:', e.message);
+      }
+    }
+
+    // Memory fallback
     user.usage.translationsCount += 1;
-    user.usage.secondsTotal += Number(seconds) || 3;
+    user.usage.secondsTotal += secNum;
     user.usage.lastUsedAt = new Date().toISOString();
     user.updatedAt = new Date().toISOString();
 
-    this.persist();
-
-    const updatedPermission = this.checkUsagePermission(clean);
+    const updated = await this.checkUsagePermission(clean);
     return {
       success: true,
       allowed: true,
-      reason: updatedPermission.reason,
-      stats: updatedPermission
+      reason: updated.reason,
+      stats: updated
     };
   }
 
-  toggleDeveloperBypass(email, enabled) {
+  async toggleDeveloperBypass(email, enabled) {
     const clean = (email || '').toLowerCase().trim();
-    const user = this.getUser(clean);
+    const user = await this.getUser(clean);
     if (!user || !user.isDeveloper) {
       throw new Error('Only developer accounts can toggle developer bypass mode');
     }
-    user.developerBypass = Boolean(enabled);
-    user.updatedAt = new Date().toISOString();
-    this.persist();
-    return this.checkUsagePermission(clean);
+
+    if (this.isPostgres && this.pool) {
+      await this.pool.query(`
+        UPDATE users
+        SET developer_bypass = $2, updated_at = NOW()
+        WHERE LOWER(email) = LOWER($1);
+      `, [clean, Boolean(enabled)]);
+    } else {
+      user.developerBypass = Boolean(enabled);
+    }
+
+    return await this.checkUsagePermission(clean);
   }
 
-  setTier(email, tier) {
+  async setTier(email, tier) {
     const clean = (email || '').toLowerCase().trim();
-    let user = this.getUser(clean);
-    if (!user) {
-      user = this.findOrCreateUser({ email: clean });
+    const isPaid = tier === 'pro' || tier === 'enterprise' || tier === 'developer';
+
+    if (this.isPostgres && this.pool) {
+      const res = await this.pool.query(`
+        UPDATE users
+        SET tier = $2, is_paid = $3, updated_at = NOW()
+        WHERE LOWER(email) = LOWER($1)
+        RETURNING *;
+      `, [clean, tier, isPaid]);
+      return this.formatUser(res.rows[0]);
     }
-    user.tier = tier;
-    user.isPaid = tier === 'pro' || tier === 'enterprise' || tier === 'developer';
-    user.updatedAt = new Date().toISOString();
-    this.persist();
+
+    let user = this.memoryUsers[clean];
+    if (user) {
+      user.tier = tier;
+      user.isPaid = isPaid;
+    }
     return user;
   }
 
-  getPlatformMetrics() {
-    const users = Object.values(this.memory.users);
+  async getPlatformMetrics() {
+    if (this.initPromise) await this.initPromise;
+    if (this.isPostgres && this.pool) {
+      try {
+        const res = await this.pool.query(`
+          SELECT 
+            COUNT(*)::INT as total_users,
+            COUNT(*) FILTER (WHERE is_developer)::INT as developers,
+            COUNT(*) FILTER (WHERE is_paid)::INT as paid_users,
+            COALESCE(SUM(translations_count), 0)::INT as total_translations,
+            COALESCE(SUM(seconds_total), 0)::INT as total_seconds
+          FROM users;
+        `);
+        const row = res.rows[0] || {};
+        const totalUsers = row.total_users || 0;
+        const paidUsers = row.paid_users || 0;
+        return {
+          totalUsers,
+          developers: row.developers || 0,
+          paidUsers,
+          freeUsers: totalUsers - paidUsers,
+          totalTranslations: row.total_translations || 0,
+          totalMinutes: Math.round((row.total_seconds || 0) / 60)
+        };
+      } catch (e) {
+        console.error('[DB] getPlatformMetrics error:', e.message);
+      }
+    }
+
+    const users = Object.values(this.memoryUsers);
     const totalUsers = users.length;
-    const developers = users.filter(u => u.isDeveloper).length;
     const paidUsers = users.filter(u => u.isPaid).length;
     const totalTranslations = users.reduce((sum, u) => sum + (u.usage.translationsCount || 0), 0);
     const totalSeconds = users.reduce((sum, u) => sum + (u.usage.secondsTotal || 0), 0);
 
     return {
       totalUsers,
-      developers,
+      developers: users.filter(u => u.isDeveloper).length,
       paidUsers,
       freeUsers: totalUsers - paidUsers,
       totalTranslations,

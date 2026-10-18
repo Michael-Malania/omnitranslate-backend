@@ -41,21 +41,21 @@ app.get(['/', '/api/health'], (req, res) => {
 });
 
 // 2. Google Authentication & Profile Sync
-app.post('/api/auth/google', (req, res) => {
+app.post('/api/auth/google', async (req, res) => {
   try {
     const { email, displayName, photoUrl, platform = 'desktop' } = req.body;
     if (!email) {
       return res.status(400).json({ error: 'Email is required for Google Sign-In' });
     }
 
-    const user = db.findOrCreateUser({
+    const user = await db.findOrCreateUser({
       email,
       displayName,
       photoUrl,
       platform
     });
 
-    const permission = db.checkUsagePermission(email);
+    const permission = await db.checkUsagePermission(email);
 
     return res.json({
       success: true,
@@ -82,19 +82,19 @@ app.post('/api/auth/google', (req, res) => {
 });
 
 // 3. User Profile & Permission Check
-app.get('/api/user/profile', (req, res) => {
+app.get('/api/user/profile', async (req, res) => {
   try {
     const email = req.query.email || req.headers['x-user-email'];
     if (!email) {
       return res.status(400).json({ error: 'email query parameter is required' });
     }
 
-    let user = db.getUser(email);
+    let user = await db.getUser(email);
     if (!user) {
-      user = db.findOrCreateUser({ email });
+      user = await db.findOrCreateUser({ email });
     }
 
-    const permission = db.checkUsagePermission(email);
+    const permission = await db.checkUsagePermission(email);
 
     return res.json({
       success: true,
@@ -118,14 +118,14 @@ app.get('/api/user/profile', (req, res) => {
 });
 
 // 4. Record Usage (Triggered on Translation)
-app.post('/api/usage/record', (req, res) => {
+app.post('/api/usage/record', async (req, res) => {
   try {
     const { email, seconds = 3, chars = 0, platform = 'desktop' } = req.body;
     if (!email) {
       return res.status(400).json({ error: 'email is required to record usage' });
     }
 
-    const result = db.recordUsage({
+    const result = await db.recordUsage({
       email,
       seconds,
       chars,
@@ -144,14 +144,14 @@ app.post('/api/usage/record', (req, res) => {
 });
 
 // 5. Developer Mode Toggle (Turn off / on metrics)
-app.post('/api/user/toggle-developer-bypass', (req, res) => {
+app.post('/api/user/toggle-developer-bypass', async (req, res) => {
   try {
     const { email, enabled } = req.body;
     if (!email) {
       return res.status(400).json({ error: 'email is required' });
     }
 
-    const permission = db.toggleDeveloperBypass(email, enabled);
+    const permission = await db.toggleDeveloperBypass(email, enabled);
     return res.json({
       success: true,
       message: `Developer bypass ${enabled ? 'ENABLED (unlimited)' : 'DISABLED (simulating regular user)'}`,
@@ -164,15 +164,15 @@ app.post('/api/user/toggle-developer-bypass', (req, res) => {
 });
 
 // 6. Upgrade Tier (Paywall checkout completion)
-app.post('/api/user/upgrade', (req, res) => {
+app.post('/api/user/upgrade', async (req, res) => {
   try {
     const { email, tier = 'pro' } = req.body;
     if (!email) {
       return res.status(400).json({ error: 'email is required' });
     }
 
-    const user = db.setTier(email, tier);
-    const permission = db.checkUsagePermission(email);
+    const user = await db.setTier(email, tier);
+    const permission = await db.checkUsagePermission(email);
 
     return res.json({
       success: true,
@@ -187,9 +187,9 @@ app.post('/api/user/upgrade', (req, res) => {
 });
 
 // 7. Platform Aggregate Metrics
-app.get('/api/metrics/summary', (req, res) => {
+app.get('/api/metrics/summary', async (req, res) => {
   try {
-    const metrics = db.getPlatformMetrics();
+    const metrics = await db.getPlatformMetrics();
     return res.json({
       success: true,
       metrics
@@ -201,12 +201,24 @@ app.get('/api/metrics/summary', (req, res) => {
 });
 
 // Start Server
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`=======================================================`);
-  console.log(`🚀 OmniTranslate Shared Backend running on port ${PORT}`);
-  console.log(`📡 Local URL: http://localhost:${PORT}`);
-  console.log(`🔐 Developer accounts active with automatic bypass`);
-  console.log(`=======================================================`);
-});
+async function startServer() {
+  if (db.initPromise) {
+    try {
+      await db.initPromise;
+    } catch (e) {
+      console.warn('⚠️ [DB] Warning during startup:', e.message);
+    }
+  }
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`=======================================================`);
+    console.log(`🚀 OmniTranslate Shared Backend running on port ${PORT}`);
+    console.log(`📡 Local URL: http://localhost:${PORT}`);
+    console.log(`🔐 Developer accounts active with automatic bypass`);
+    console.log(`=======================================================`);
+  });
+}
+
+startServer();
 
 module.exports = app;
